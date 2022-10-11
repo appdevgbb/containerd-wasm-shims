@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+use std::sync::{Condvar, Mutex};
 use std::sync::mpsc::channel;
 use std::sync::mpsc::Sender;
 use std::thread;
@@ -13,18 +14,9 @@ use containerd_shim_wasm::sandbox::Instance;
 use containerd_shim_wasm::sandbox::instance::EngineGetter;
 use containerd_shim_wasm::sandbox::oci;
 use log::info;
-use spin_http::HttpTrigger;
-use spin_trigger::{TriggerExecutor, TriggerExecutorBuilder};
 
 use tokio::runtime::Runtime;
-use wasmtime::OptLevel;
-use reqwest::Url;
-use anyhow::{Result, anyhow};
-
-mod loader;
-mod podio;
-
-static SPIN_ADDR: &str = "0.0.0.0:80";
+use slight_lib::commands::run::handle_run;
 
 pub struct Wasi {
     exit_code: Arc<(Mutex<Option<(u32, DateTime<Utc>)>>, Condvar)>,
@@ -36,6 +28,7 @@ pub struct Wasi {
     shutdown_signal: Arc<(Mutex<bool>, Condvar)>,
 }
 
+
 pub fn prepare_module(bundle: String) -> Result<(PathBuf, PathBuf), Error> {
     let mut spec = oci::load(Path::new(&bundle)
         .join("config.json")
@@ -45,60 +38,38 @@ pub fn prepare_module(bundle: String) -> Result<(PathBuf, PathBuf), Error> {
 
     spec.canonicalize_rootfs(&bundle)
         .map_err(|err| Error::Others(format!("could not canonicalize rootfs: {}", err)))?;
+    
 
     let working_dir = oci::get_root(&spec);
-    let mod_path = working_dir.join("spin.toml");
-    Ok((working_dir.to_path_buf(), mod_path))
-}
 
+    // change the working directory to the rootfs
+    std::os::unix::fs::chroot(working_dir).unwrap();
+    std::env::set_current_dir("/").unwrap();
 
-impl Wasi {
-    async fn build_spin_application(
-        mod_path: PathBuf,
-        working_dir: PathBuf,
-    ) -> Result<spin_manifest::Application, Error> {
-        Ok(spin_loader::from_file(mod_path, working_dir, &None).await?)
-    }
-
-    async fn build_spin_trigger(
-        working_dir: PathBuf,
-        app: spin_manifest::Application,
-        stdout_pipe_path: PathBuf,
-        stderr_pipe_path: PathBuf,
-        stdin_pipe_path: PathBuf,
-    ) -> Result<HttpTrigger> {
-
-        // Build and write app lock file
-        let locked_app = spin_trigger::locked::build_locked_app(app, &working_dir)?;
-        let locked_path = working_dir.join("spin.lock");
-        let locked_app_contents =
-            serde_json::to_vec_pretty(&locked_app).expect("could not serialize locked app");
-        std::fs::write(&locked_path, locked_app_contents).expect("could not write locked app");
-        let locked_url = Url::from_file_path(&locked_path).map_err(|_| anyhow!("cannot convert to file URL: {locked_path:?}"))?.to_string();
-
-        // Build trigger config
-        let loader = loader::TriggerLoader::new(working_dir, true);
-
-        let executor: HttpTrigger = {
-            let mut builder = TriggerExecutorBuilder::<HttpTrigger>::new(loader);
-            let config = builder.wasmtime_config_mut();
-            config
-                .cache_config_load_default()?
-                .cranelift_opt_level(OptLevel::Speed);
-
-            let logging_hooks = podio::PodioLoggingTriggerHooks::new(stdout_pipe_path, stderr_pipe_path, stdin_pipe_path);
-            builder.hooks(logging_hooks);
-
-            builder.build(locked_url).await?
+    // add env to current proc
+    let env = spec
+        .process()
+        .as_ref()
+        .unwrap()
+        .env()
+        .as_ref()
+        .unwrap();
+    for v in env {
+        match v.split_once('=') {
+            None => {}
+            Some(t) => std::env::set_var(t.0.to_string(), t.1.to_string()),
         };
-
-        Ok(executor)
     }
+
+    let mod_path = PathBuf::from("slightfile.toml");
+    let wasm_path = PathBuf::from("app.wasm");
+    Ok((wasm_path, mod_path))
 }
 
 impl Instance for Wasi {
     type E = ();
     fn new(id: String, cfg: Option<&InstanceConfig<Self::E>>) -> Self {
+        info!(">>> new instance");
         let cfg = cfg.unwrap();
         Wasi {
             exit_code: Arc::new((Mutex::new(None), Condvar::new())),
@@ -110,24 +81,23 @@ impl Instance for Wasi {
             shutdown_signal: Arc::new((Mutex::new(false), Condvar::new())),
         }
     }
+
     fn start(&self) -> Result<u32, Error> {
+        info!(">>> shim starts");
         let exit_code = self.exit_code.clone();
         let shutdown_signal = self.shutdown_signal.clone();
         let (tx, rx) = channel::<Result<(), Error>>();
         let bundle = self.bundle.clone();
-        let stdin = self.stdin.clone();
-        let stdout = self.stdout.clone();
-        let stderr = self.stderr.clone();
-
-        info!(
-            " >>> stdin: {:#?}, stdout: {:#?}, stderr: {:#?}",
-            stdin, stdout, stderr
-        );
+        
+        // FIXME: redirect slight stdio to pod stdio
+        let _pod_stdin = self.stdin.clone();
+        let _pod_stdout = self.stdout.clone();
+        let _pod_stderr = self.stderr.clone();
 
         thread::Builder::new()
             .name(self.id.clone())
             .spawn(move || {
-                let (working_dir, mod_path) = match prepare_module(bundle) {
+                let (wasm_path, mod_path) = match prepare_module(bundle) {
                     Ok(f) => f,
                     Err(err) => {
                         tx.send(Err(err)).unwrap();
@@ -136,39 +106,13 @@ impl Instance for Wasi {
                 };
 
                 info!(" >>> loading module: {}", mod_path.display());
-                info!(" >>> working dir: {}", working_dir.display());
-                info!(" >>> starting spin");
+                info!(" >>> wasm path: {}", wasm_path.display());
+                info!(" >>> starting slight");
 
                 let rt = Runtime::new().unwrap();
                 rt.block_on(async {
-                    info!(" >>> building spin application");
-                    let app = match Wasi::build_spin_application(mod_path, working_dir.clone()).await {
-                        Ok(app) => app,
-                        Err(err) => {
-                            tx.send(Err(err)).unwrap();
-                            return;
-                        }
-                    };
-
-                    info!(" >>> building spin trigger");
-                    let http_trigger = match Wasi::build_spin_trigger(
-                        working_dir,
-                        app,
-                        PathBuf::from(stdout),
-                        PathBuf::from(stderr),
-                        PathBuf::from(stdin),
-                    )
-                        .await
-                    {
-                        Ok(http_trigger) => http_trigger,
-                        Err(err) => {
-                            tx.send(Err(
-                                Error::Others(format!("could not build spin trigger: {}", err)),
-                            )).unwrap();
-                            return;
-                        }
-                    };
-
+                    let toml_file_path = mod_path;
+                    
                     let rx_future = tokio::task::spawn_blocking(move || {
                         let (lock, cvar) = &*shutdown_signal;
                         let mut shutdown = lock.lock().unwrap();
@@ -177,12 +121,7 @@ impl Instance for Wasi {
                         }
                     });
 
-                    info!(" >>> running spin trigger");
-                    let f = http_trigger.run(spin_http::CliArgs {
-                        address: SPIN_ADDR.to_string(),
-                        tls_cert: None,
-                        tls_key: None,
-                    });
+                    let f = handle_run(wasm_path, &toml_file_path);
 
                     info!(" >>> notifying main thread we are about to start");
                     tx.send(Ok(())).unwrap();
@@ -243,7 +182,7 @@ impl Instance for Wasi {
     fn delete(&self) -> Result<(), Error> {
         Ok(())
     }
-
+    
     fn wait(&self, channel: Sender<(u32, DateTime<Utc>)>) -> Result<(), Error> {
         let code = self.exit_code.clone();
         thread::spawn(move || {
@@ -268,5 +207,5 @@ impl EngineGetter for Wasi {
 }
 
 fn main() {
-    shim::run::<ShimCli<Wasi, _>>("io.containerd.spin.v1", None);
+    shim::run::<ShimCli<Wasi, _>>("io.containerd.slight.v1", None);
 }
