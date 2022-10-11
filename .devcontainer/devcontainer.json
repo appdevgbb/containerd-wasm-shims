@@ -1,27 +1,24 @@
-{
-	"name": "Docker in Docker",
-	"dockerFile": "Dockerfile",
-	"runArgs": ["--init", "--privileged"],
-	"mounts": ["source=dind-var-lib-docker,target=/var/lib/docker,type=volume"],
-	"overrideCommand": false,
-
-	// Configure tool-specific properties.
-	"customizations": {
-		// Configure properties specific to VS Code.
-		"vscode": {
-			// Add the IDs of extensions you want installed when the container is created.
-			"extensions": [
-				"ms-azuretools.vscode-docker"
-			]
-		}
-	},
-	
-	// Use 'forwardPorts' to make a list of ports inside the container available locally.
-	// "forwardPorts": [],
-
-	// Use 'postCreateCommand' to run commands after the container is created.
-	// "postCreateCommand": "docker --version",
-	"postAttachCommand": "curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash",
-	// Comment out to connect as root instead. More info: https://aka.ms/vscode-remote/containers/non-root.
-	"remoteUser": "vscode"
-}
+  {
+    "name": "Codespace to bootstrap k3d in a Codespace",
+    //Use base codespace image then pull Valet on postCreateCommand,  
+    "image": "mcr.microsoft.com/vscode/devcontainers/universal:linux",
+    "remoteUser": "codespace",
+      "overrideCommand": false,
+      "mounts": ["source=codespaces-linux-var-lib-docker,target=/var/lib/docker,type=volume"],
+      "runArgs": [
+          "--cap-add=SYS_PTRACE",
+          "--security-opt",
+          "seccomp=unconfined",
+          "--privileged",
+          "--init"
+      ],
+      
+      // Add the IDs of extensions you want installed when the container is created.
+      "extensions": [
+          "GitHub.vscode-pull-request-github",
+          "ms-vscode.azure-account",
+          "ms-vscode.azurecli",
+          "ms-azuretools.vscode-docker",
+      ],
+      "postAttachCommand": "curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash"
+  }
